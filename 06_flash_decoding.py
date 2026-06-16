@@ -93,12 +93,24 @@ def combine_kernel(po_ptr, pm_ptr, pl_ptr, o_ptr,
     tl.store(o_ptr + pid_z * HEAD_DIM + offs_d, o.to(o_ptr.dtype.element_ty))
 
 
-def flash_decode(q, k, v, num_splits=8, BLOCK_N=64):
+def pick_splits(Sk, Z, BLOCK_N=64, target_programs=256):
+    """Choose num_splits to fill the GPU: enough programs to saturate the SMs,
+    but no finer than one block per split. Rounded down to a power of two
+    (combine_kernel indexes the splits with tl.arange)."""
+    max_useful = max(1, Sk // BLOCK_N)            # don't split finer than a block
+    by_occupancy = max(1, target_programs // Z)   # enough programs to fill the SMs
+    n = min(by_occupancy, max_useful)
+    return 1 << (n.bit_length() - 1)              # round down to power of two
+
+
+def flash_decode(q, k, v, num_splits=None, BLOCK_N=64):
     # q: (B,H,1,D)   k,v: (B,H,Sk,D)
     B, H, _, D = q.shape
     Sk = k.shape[-2]
     scale = 1.0 / (D ** 0.5)
     Z = B * H
+    if num_splits is None:
+        num_splits = pick_splits(Sk, Z, BLOCK_N)
     q = q.reshape(Z, D).contiguous()
     k = k.reshape(Z, Sk, D).contiguous()
     v = v.reshape(Z, Sk, D).contiguous()
@@ -122,10 +134,11 @@ def main():
         k = torch.randn(B, H, Sk, D, device=DEVICE, dtype=torch.bfloat16)
         v = torch.randn(B, H, Sk, D, device=DEVICE, dtype=torch.bfloat16)
 
+        splits = pick_splits(Sk, B * H)
         out = flash_decode(q, k, v)
         ref = F.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=0)
-        line = f"Sk={Sk:<6d} correct ✓"
+        line = f"Sk={Sk:<6d} splits={splits:<3d} correct ✓"
 
         if not INTERPRET:
             fd = triton.testing.do_bench(lambda: flash_decode(q, k, v))
