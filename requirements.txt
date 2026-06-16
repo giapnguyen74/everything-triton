@@ -1,0 +1,4 @@
+# Install on the CUDA workstation (Linux + NVIDIA), not on the Mac.
+# Triton ships with the CUDA PyTorch build; pin explicitly if you want.
+torch
+triton
