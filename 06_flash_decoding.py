@@ -93,10 +93,15 @@ def combine_kernel(po_ptr, pm_ptr, pl_ptr, o_ptr,
     tl.store(o_ptr + pid_z * HEAD_DIM + offs_d, o.to(o_ptr.dtype.element_ty))
 
 
-def pick_splits(Sk, Z, BLOCK_N=64, target_programs=256):
+def pick_splits(Sk, Z, BLOCK_N=64, target_programs=64):
     """Choose num_splits to fill the GPU: enough programs to saturate the SMs,
     but no finer than one block per split. Rounded down to a power of two
-    (combine_kernel indexes the splits with tl.arange)."""
+    (combine_kernel indexes the splits with tl.arange).
+
+    target_programs=64 was measured on a GB10: latency flattens once
+    splits*Z reaches ~64 (knee at splits=4 for Z=16, splits=64 for Z=1).
+    The win is huge at low Z (single request: 12x over splits=1, 1.3x over
+    torch) and negligible at high Z, where base parallelism already fills the GPU."""
     max_useful = max(1, Sk // BLOCK_N)            # don't split finer than a block
     by_occupancy = max(1, target_programs // Z)   # enough programs to fill the SMs
     n = min(by_occupancy, max_useful)

@@ -13,11 +13,14 @@ PyTorch reference, then benchmarks against it.
 | `03_flash_attention.py` | The online-softmax trick: stream K/V in blocks with a running max/denominator so a full row never has to fit in SRAM. Minimal fp32 forward. |
 | `04_flash_attention_full.py` | The real thing: bf16 + `@triton.autotune`, causal masking, and a backward pass that recomputes P from the saved logsumexp instead of storing the N×N matrix. Wrapped in a `torch.autograd.Function`. |
 | `05_flash_attention_kvcache.py` | Inference with a KV cache: *offset* causal (`offset = total_k - q_len`), so the mask is computed on the fly instead of materialized. One kernel covers full causal, chunked/ragged prefill, and decode — collapsing the three-way PyTorch `SDPA` branch into a single call. |
+| `06_flash_decoding.py` | Single-token decode (`q_len == 1`). One query gives almost no parallelism, so the reduction axis itself is split: a *split* kernel computes per-chunk partials (`o_c`, `m_c`, `l_c`) in parallel across the cache, and a *combine* kernel merges them with the same online rescale. Turns the long serial K/V scan into a parallel one. |
 
 The core idea carried from `02` onward: the softmax reduces over the K/V axis, so
 K/V is streamed (sequential inner loop with online state) while queries/heads run
 in parallel across the grid. Bigger query tiles amortize K/V loads and turn the
-matmuls into tensor-core GEMMs.
+matmuls into tensor-core GEMMs. `06` flips this for decode: when there is only one
+query, parallelism comes from splitting K/V across programs and reducing the
+partials — the GEMM becomes a GEMV, so it's purely about saturating bandwidth.
 
 ## Running
 
@@ -41,10 +44,20 @@ Times are per call; `torch` is the PyTorch reference for that op.
 | `05` kv-cache, chunked prefill (Sq=128, Sk=1024) | 0.0419 ms | 0.0990 ms | ~2.4×; torch materializes the mask tensor, we don't |
 | `05` kv-cache, ragged prefill (Sq=200, Sk=1000) | 0.0500 ms | 0.1044 ms | ~2.1×; same mask-materialization win |
 | `05` kv-cache, decode (Sq=1, Sk=1024) | 0.0406 ms | 0.0483 ms | ~1.2×; a 64-row tile on one query is wasteful — wants a flash-decoding kernel |
+| `06` decode, high parallelism (B=2,H=8, Sk=16384) | 0.349 ms | 0.354 ms | parity; B×H=16 already fills the GPU, so splitting barely helps |
+| `06` decode, single request (B=1,H=1, Sk=16384) | 0.0434 ms | 0.0572 ms | ~1.3× vs torch, **12× vs splits=1** (0.521 ms) — the real win |
 
 `04` also verifies the **backward** pass (dQ/dK/dV) against autograd for both
 causal and non-causal. The algorithm was cross-checked with a NumPy port of the
 exact tiled forward+backward against analytic gradients (errors ~1e-15).
+
+`06` is verified against torch SDPA (and a NumPy port: short/long/ragged caches,
+empty chunks). The lesson from sweeping `num_splits` on the GB10: latency flattens
+once `num_splits × (B·H)` reaches **~64 programs** — the knee is at splits=4 for
+B·H=16 and splits=64 for B·H=1. Split-KV is a *parallelism backfill*: nothing to
+gain when batch×heads already fills the GPU, but transformative for low-concurrency
+decode (a single serial scan can't saturate memory bandwidth). `pick_splits`
+targets that ~64-program sweet spot automatically.
 
 `05` (all bf16, B=2, H=8, D=64) is forward-only and verified against the PyTorch
 reference across all four regimes. The biggest speedups land on the prefill
