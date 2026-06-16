@@ -126,38 +126,42 @@ def flash_decode(q, k, v, num_splits=None, BLOCK_N=64):
     return o.reshape(B, H, 1, D)
 
 
+def sweep(B, H, D, Sk, BLOCK_N=64):
+    q = torch.randn(B, H, 1, D, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn(B, H, Sk, D, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn(B, H, Sk, D, device=DEVICE, dtype=torch.bfloat16)
+
+    chosen = pick_splits(Sk, B * H, BLOCK_N)
+    torch.testing.assert_close(flash_decode(q, k, v),
+                               F.scaled_dot_product_attention(q, k, v),
+                               atol=2e-2, rtol=0)
+    print(f"B={B} H={H} (Z={B*H})  Sk={Sk:<6d} correct ✓  (pick_splits -> {chosen})")
+    if INTERPRET:
+        return
+
+    torch_ms = triton.testing.do_bench(lambda: F.scaled_dot_product_attention(q, k, v))
+    max_splits = max(1, Sk // BLOCK_N)
+    s, best = 1, (None, float("inf"))
+    while s <= max_splits:
+        ms = triton.testing.do_bench(lambda s=s: flash_decode(q, k, v, num_splits=s))
+        star = " *" if s == chosen else "  "
+        print(f"    splits={s:<4d} {ms:.4f} ms{star}")
+        if ms < best[1]:
+            best = (s, ms)
+        s *= 2
+    print(f"    torch {torch_ms:.4f} ms   |   best splits={best[0]} @ {best[1]:.4f} ms")
+
+
 def main():
     banner()
-    B, H, D = 2, 8, 64
-    BLOCK_N = 64
+    D = 64
+    # High parallelism: B*H=16 already fills the GPU -> splitting barely helps.
     for Sk in (1024, 4096, 16384):
-        q = torch.randn(B, H, 1, D, device=DEVICE, dtype=torch.bfloat16)
-        k = torch.randn(B, H, Sk, D, device=DEVICE, dtype=torch.bfloat16)
-        v = torch.randn(B, H, Sk, D, device=DEVICE, dtype=torch.bfloat16)
-
-        # correctness once (uses the pick_splits default)
-        chosen = pick_splits(Sk, B * H, BLOCK_N)
-        torch.testing.assert_close(flash_decode(q, k, v),
-                                   F.scaled_dot_product_attention(q, k, v),
-                                   atol=2e-2, rtol=0)
-        print(f"Sk={Sk:<6d} correct ✓  (pick_splits -> {chosen})")
-
-        if INTERPRET:
-            continue
-
-        # sweep num_splits: powers of two from 4 up to one block per split
-        torch_ms = triton.testing.do_bench(lambda: F.scaled_dot_product_attention(q, k, v))
-        max_splits = max(4, Sk // BLOCK_N)
-        s = 4
-        best = (None, float("inf"))
-        while s <= max_splits:
-            ms = triton.testing.do_bench(lambda s=s: flash_decode(q, k, v, num_splits=s))
-            star = " *" if s == chosen else "  "
-            print(f"    splits={s:<4d} {ms:.4f} ms{star}")
-            if ms < best[1]:
-                best = (s, ms)
-            s *= 2
-        print(f"    torch {torch_ms:.4f} ms   |   best splits={best[0]} @ {best[1]:.4f} ms")
+        sweep(2, 8, D, Sk)
+    # Low parallelism: a single (batch, head) -> one serial scan can't fill the
+    # GPU, so this is where split-KV should actually pay off.
+    print("--- low parallelism (single request) ---")
+    sweep(1, 1, D, 16384)
 
 
 if __name__ == "__main__":
