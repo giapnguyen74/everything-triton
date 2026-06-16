@@ -129,22 +129,35 @@ def flash_decode(q, k, v, num_splits=None, BLOCK_N=64):
 def main():
     banner()
     B, H, D = 2, 8, 64
+    BLOCK_N = 64
     for Sk in (1024, 4096, 16384):
         q = torch.randn(B, H, 1, D, device=DEVICE, dtype=torch.bfloat16)
         k = torch.randn(B, H, Sk, D, device=DEVICE, dtype=torch.bfloat16)
         v = torch.randn(B, H, Sk, D, device=DEVICE, dtype=torch.bfloat16)
 
-        splits = pick_splits(Sk, B * H)
-        out = flash_decode(q, k, v)
-        ref = F.scaled_dot_product_attention(q, k, v)
-        torch.testing.assert_close(out, ref, atol=2e-2, rtol=0)
-        line = f"Sk={Sk:<6d} splits={splits:<3d} correct ✓"
+        # correctness once (uses the pick_splits default)
+        chosen = pick_splits(Sk, B * H, BLOCK_N)
+        torch.testing.assert_close(flash_decode(q, k, v),
+                                   F.scaled_dot_product_attention(q, k, v),
+                                   atol=2e-2, rtol=0)
+        print(f"Sk={Sk:<6d} correct ✓  (pick_splits -> {chosen})")
 
-        if not INTERPRET:
-            fd = triton.testing.do_bench(lambda: flash_decode(q, k, v))
-            r = triton.testing.do_bench(lambda: F.scaled_dot_product_attention(q, k, v))
-            line += f"   flash_decode {fd:.4f} ms   torch {r:.4f} ms"
-        print(line)
+        if INTERPRET:
+            continue
+
+        # sweep num_splits: powers of two from 4 up to one block per split
+        torch_ms = triton.testing.do_bench(lambda: F.scaled_dot_product_attention(q, k, v))
+        max_splits = max(4, Sk // BLOCK_N)
+        s = 4
+        best = (None, float("inf"))
+        while s <= max_splits:
+            ms = triton.testing.do_bench(lambda s=s: flash_decode(q, k, v, num_splits=s))
+            star = " *" if s == chosen else "  "
+            print(f"    splits={s:<4d} {ms:.4f} ms{star}")
+            if ms < best[1]:
+                best = (s, ms)
+            s *= 2
+        print(f"    torch {torch_ms:.4f} ms   |   best splits={best[0]} @ {best[1]:.4f} ms")
 
 
 if __name__ == "__main__":
